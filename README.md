@@ -38,7 +38,16 @@ Built with Rust, [Ratatui](https://ratatui.rs/), and [Tokio](https://tokio.rs/).
 cargo run
 ```
 
-### Install Globally
+### Install via Homebrew (macOS)
+```bash
+# Tap the repository
+brew tap crusty-crumpet-79/remarkable-tui https://github.com/crusty-crumpet-79/remarkable-tui
+
+# Install the package
+brew install remarkable-tui
+```
+
+### Install Globally (Cargo)
 To use the `remarkable` command from anywhere:
 ```bash
 cargo install --path .
