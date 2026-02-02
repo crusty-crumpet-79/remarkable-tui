@@ -4,7 +4,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use futures::StreamExt;
+use futures::{future::BoxFuture, StreamExt};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
@@ -22,6 +22,15 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc;
+
+fn sanitize_filename(name: &str, is_folder: bool) -> String {
+    let safe_name = name.replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '-' && c != '_', "_");
+    if !is_folder && !safe_name.ends_with(".pdf") {
+        format!("{}.pdf", safe_name)
+    } else {
+        safe_name
+    }
+}
 
 // --- Data Structures ---
 
@@ -44,13 +53,26 @@ impl Item {
 enum InputMode {
     Normal,
     Uploading,
+    Downloading,
 }
 
 enum AppMessage {
     DocumentsFetched(Vec<Item>), // items
-    DownloadComplete(String),
+    DownloadComplete(String, String), // name, path
     UploadComplete(String),
     Error(String),
+}
+
+fn expand_path(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+    }
+    if path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}{}", home, &path[1..]);
+        }
+    }
+    path.to_string()
 }
 
 struct AppLogic {
@@ -141,48 +163,72 @@ impl AppLogic {
     fn download(&mut self) {
         if let Some(i) = self.state.selected() {
             if let Some(item) = self.items.get(i) {
-                if !item.is_folder() {
+                self.input_mode = InputMode::Downloading;
+                self.input_buffer.clear();
+                self.status_msg = format!("Enter download path for '{}':", item.visible_name);
+            }
+        }
+    }
+
+    fn cancel_download(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+        self.status_msg = "Download cancelled.".into();
+    }
+
+        fn confirm_download(&mut self) {
+            let raw_path = self.input_buffer.trim();
+            if raw_path.is_empty() {
+                self.status_msg = "Path cannot be empty.".into();
+                return;
+            }
+            let path_str = expand_path(raw_path);
+    
+            if let Some(i) = self.state.selected() {
+                if let Some(item) = self.items.get(i) {
                     let client = self.client.clone();
-                    let id = item.id.clone();
+                    let item_clone = item.clone(); // Clone the item
                     let name = item.visible_name.clone();
                     let tx = self.tx.clone();
-                    self.status_msg = format!("Downloading {}...", name);
+                    let dest_path = path_str.clone();
+    
+                    self.input_mode = InputMode::Normal;
+                    self.status_msg = format!("Downloading {} to {}...", name, dest_path);
                     
                     tokio::spawn(async move {
-                        match download_file(&client, &id, &name).await {
-                            Ok(_) => {
-                                let _ = tx.send(AppMessage::DownloadComplete(name)).await;
+                        match download_selection(client, item_clone, dest_path).await {
+                            Ok(final_path) => {
+                                let _ = tx.send(AppMessage::DownloadComplete(name, final_path)).await;
                             },
                             Err(e) => {
                                 let _ = tx.send(AppMessage::Error(format!("Download failed: {}", e))).await;
                             }
                         }
                     });
-                } else {
-                    self.status_msg = "Cannot download a folder.".into();
                 }
             }
         }
-    }
-
-    fn start_upload(&mut self) {
-        self.input_mode = InputMode::Uploading;
-        self.input_buffer.clear();
-        self.status_msg = "Enter file path to upload:".into();
-    }
-
-    fn cancel_upload(&mut self) {
-        self.input_mode = InputMode::Normal;
-        self.input_buffer.clear();
-        self.status_msg = "Upload cancelled.".into();
-    }
-
-    fn confirm_upload(&mut self) {
-        let path_str = self.input_buffer.trim().to_string();
-        if path_str.is_empty() {
+    
+        fn start_upload(&mut self) {
+            self.input_mode = InputMode::Uploading;
+            self.input_buffer.clear();
+            self.status_msg = "Enter file path to upload:".into();
+        }
+    
+        fn cancel_upload(&mut self) {
+            self.input_mode = InputMode::Normal;
+            self.input_buffer.clear();
+            self.status_msg = "Upload cancelled.".into();
+        }
+    
+        fn confirm_upload(&mut self) {
+        let raw_path = self.input_buffer.trim();
+        if raw_path.is_empty() {
             self.status_msg = "Path cannot be empty.".into();
             return;
         }
+        let path_str = expand_path(raw_path);
+        
         let path = Path::new(&path_str);
         if !path.exists() {
             self.status_msg = "File does not exist.".into();
@@ -215,7 +261,32 @@ impl AppLogic {
             }
         });
     }
-}
+
+    fn get_help_text(&self) -> String {
+            match self.input_mode {
+                InputMode::Uploading => "[Enter] Confirm Upload [Esc] Cancel".to_string(),
+                InputMode::Downloading => "[Enter] Confirm Download [Esc] Cancel".to_string(),
+                InputMode::Normal => {
+                    let mut actions = vec!["[q] Quit", "[u] Upload", "[r] Refresh", "[j/k] Nav"];
+                    
+                    if !self.history.is_empty() {
+                        actions.push("[h] Back");
+                    }
+    
+                    if let Some(i) = self.state.selected() {
+                        if let Some(item) = self.items.get(i) {
+                            if item.is_folder() {
+                                actions.push("[l/Enter] Open");
+                            } else {
+                                actions.push("[d] Download");
+                            }
+                        }
+                    }
+                    
+                    actions.join(" | ")
+                }
+            }
+        }}
 
 // --- Network Helpers ---
 
@@ -232,24 +303,66 @@ async fn fetch_documents(client: &Client, guid: &Option<String>) -> Result<Vec<I
     Ok(items)
 }
 
-async fn download_file(client: &Client, id: &str, name: &str) -> Result<()> {
-    let url = format!("{}/download/{}/pdf", BASE_URL, id);
-    let resp = client.get(&url).send().await?;
-    
-    // Sanitize filename
-    let safe_name = name.replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '-' && c != '_', "_");
-    let file_name = if safe_name.ends_with(".pdf") { safe_name } else { format!("{}.pdf", safe_name) };
+fn download_recursive(client: Client, item: Item, target_path: std::path::PathBuf) -> BoxFuture<'static, Result<String>> {
+    Box::pin(async move {
+        if item.is_folder() {
+            tokio::fs::create_dir_all(&target_path).await?;
+            let children = fetch_documents(&client, &Some(item.id)).await?;
+            for child in children {
+                let child_name = sanitize_filename(&child.visible_name, child.is_folder());
+                let child_path = target_path.join(child_name);
+                download_recursive(client.clone(), child, child_path).await?;
+            }
+            Ok(target_path.to_string_lossy().to_string())
+        } else {
+            let url = format!("{}/download/{}/pdf", BASE_URL, item.id);
+            let resp = client.get(&url).send().await?;
+            
+            // Ensure parent exists (should be handled by caller usually, but good for safety)
+            if let Some(parent) = target_path.parent() {
+                if !parent.exists() {
+                     tokio::fs::create_dir_all(parent).await?;
+                }
+            }
 
-    let mut file = tokio::fs::File::create(&file_name).await?;
-    let mut stream = resp.bytes_stream();
+            let mut file = tokio::fs::File::create(&target_path).await?;
+            let mut stream = resp.bytes_stream();
 
-    while let Some(item) = stream.next().await {
-        let chunk = item?;
-        use tokio::io::AsyncWriteExt;
-        file.write_all(&chunk).await?;
+            while let Some(chunk_res) = stream.next().await {
+                let chunk = chunk_res?;
+                use tokio::io::AsyncWriteExt;
+                file.write_all(&chunk).await?;
+            }
+            Ok(target_path.to_string_lossy().to_string())
+        }
+    })
+}
+
+async fn download_selection(client: Client, item: Item, dest_path: String) -> Result<String> {
+    let output_path = Path::new(&dest_path);
+    let item_name = sanitize_filename(&item.visible_name, item.is_folder());
+
+    // Determine final path
+    let is_dir_target = dest_path.ends_with('/') || dest_path.ends_with(std::path::MAIN_SEPARATOR) || output_path.is_dir();
+
+    let final_path = if is_dir_target {
+        if !output_path.exists() {
+             return Err(anyhow::anyhow!("Directory '{}' does not exist.", dest_path));
+        }
+        output_path.join(item_name)
+    } else {
+        // If user gave a file-like path for a folder download, we treat it as the folder name
+        output_path.to_path_buf()
+    };
+
+    // Ensure parent dir exists
+    if let Some(parent) = final_path.parent() {
+        if !parent.exists() {
+            return Err(anyhow::anyhow!("Directory '{}' does not exist.", parent.display()));
+        }
     }
-    
-    Ok(())
+
+    download_recursive(client, item, final_path).await
 }
 
 async fn upload_file(client: &Client, path_str: &str) -> Result<()> {
@@ -354,6 +467,13 @@ async fn run_app<B: Backend>(
                             KeyCode::Backspace => { app.input_buffer.pop(); },
                             _ => {}
                         },
+                        InputMode::Downloading => match key.code {
+                            KeyCode::Enter => app.confirm_download(),
+                            KeyCode::Esc => app.cancel_download(),
+                            KeyCode::Char(c) => app.input_buffer.push(c),
+                            KeyCode::Backspace => { app.input_buffer.pop(); },
+                            _ => {}
+                        },
                     }
                 }
             }
@@ -370,8 +490,8 @@ async fn run_app<B: Backend>(
                     app.items = items;
                     app.status_msg = format!("Loaded {} items.", app.items.len());
                 },
-                AppMessage::DownloadComplete(name) => {
-                    app.status_msg = format!("Downloaded {}.", name);
+                AppMessage::DownloadComplete(name, path) => {
+                    app.status_msg = format!("Downloaded {} to {}.", name, path);
                 },
                 AppMessage::UploadComplete(name) => {
                     app.status_msg = format!("Uploaded {}. Refreshing...", name);
@@ -387,11 +507,11 @@ async fn run_app<B: Backend>(
 }
 
 fn ui(f: &mut Frame, app: &mut AppLogic) {
-    let chunks = Layout::default()
+    let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(4),
         ])
         .split(f.area());
 
@@ -416,24 +536,49 @@ fn ui(f: &mut Frame, app: &mut AppLogic) {
         .highlight_style(Style::default().add_modifier(Modifier::BOLD).bg(Color::DarkGray))
         .highlight_symbol("> ");
 
-    f.render_stateful_widget(items_list, chunks[0], &mut app.state);
+    f.render_stateful_widget(items_list, main_chunks[0], &mut app.state);
+
+    // Bottom Box (Status + Keybinds)
+    let bottom_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Status ");
+    
+    let bottom_area = main_chunks[1];
+    f.render_widget(bottom_block.clone(), bottom_area);
+
+    let bottom_inner = bottom_block.inner(bottom_area);
+    
+    let bottom_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(bottom_inner);
 
     // Status Bar
     let status_style = match app.input_mode {
-        InputMode::Uploading => Style::default().bg(Color::Blue).fg(Color::White),
-        InputMode::Normal => Style::default().bg(Color::White).fg(Color::Black),
+        InputMode::Uploading | InputMode::Downloading => Style::default().bg(Color::Blue).fg(Color::White),
+        InputMode::Normal => Style::default().fg(Color::White),
     };
     let status = Paragraph::new(app.status_msg.clone()).style(status_style);
-    f.render_widget(status, chunks[1]);
+    f.render_widget(status, bottom_chunks[0]);
+
+    // Keybinds Bar
+    let help_text = app.get_help_text();
+    let help = Paragraph::new(help_text).style(Style::default().fg(Color::White));
+    f.render_widget(help, bottom_chunks[1]);
 
     // Input Modal
-    if let InputMode::Uploading = app.input_mode {
+    if let InputMode::Uploading | InputMode::Downloading = app.input_mode {
         let area = centered_rect(60, 20, f.area());
         f.render_widget(Clear, area); // Clear background
 
+        let title = if let InputMode::Uploading = app.input_mode { " Upload File " } else { " Download File " };
+
         let input_block = Block::default()
             .borders(Borders::ALL)
-            .title(" Upload File ")
+            .title(title)
             .style(Style::default().bg(Color::Black));
         
         let input_text = Paragraph::new(app.input_buffer.clone())
